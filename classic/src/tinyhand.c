@@ -38,6 +38,18 @@
 #define kPolyH 64
 #define kPolyV 20
 
+/* Palm height in the design coordinates: fingertip y=0 to the wrist,
+   where the stick starts (the kHY/kRobot values of 82). The macOS app
+   sizes that palm to pointerSize, default 0.13 of the screen height.
+   gScale is 8.8 fixed point (256 = one design pixel), chosen once from
+   qd.screenBits.bounds at launch. */
+#define kWristV 82
+#define kScaleOne 256
+#define kHandFracNum 13
+#define kHandFracDen 100
+#define kScaleMin 64
+#define kScaleMax 1024
+
 typedef struct InkSeg {
     short x0;
     short y0;
@@ -65,6 +77,7 @@ static PolyHandle gHand;
 static InkSeg gInk[kMaxSeg];
 static short gInkCount;
 static short gInkNext;
+static short gScale = kScaleOne;
 
 /* Fingertip at (0, 0). Index up on the left, other fingers folded,
    thumb further left. The stick hangs from the wrist, to the right of
@@ -107,6 +120,38 @@ static short sab(short v)
     if (v < 0)
         return (short)-v;
     return v;
+}
+
+/* Map a design-coordinate delta onto the screen. Half rounds away from 0. */
+static short sc(short v)
+{
+    long s;
+
+    if (v >= 0)
+        s = ((long)v * (long)gScale + 128L) / (long)kScaleOne;
+    else
+        s = ((long)v * (long)gScale - 128L) / (long)kScaleOne;
+    return (short)s;
+}
+
+static void choose_scale(void)
+{
+    Rect b;
+    short sh;
+    long den;
+    long num;
+
+    b = qd.screenBits.bounds;
+    sh = (short)(b.bottom - b.top);
+    if (sh < 1)
+        sh = 342;
+    den = (long)kHandFracDen * (long)kWristV;
+    num = (256L * (long)kHandFracNum * (long)sh + den / 2) / den;
+    if (num < (long)kScaleMin)
+        num = (long)kScaleMin;
+    if (num > (long)kScaleMax)
+        num = (long)kScaleMax;
+    gScale = (short)num;
 }
 
 static void show_arrow(void)
@@ -233,10 +278,10 @@ static void frame_hand_lines(short hx, short hy)
 
     n = (short)(sizeof kHX / sizeof kHX[0]);
     PenNormal();
-    MoveTo((short)(hx + kHX[0]), (short)(hy + kHY[0]));
+    MoveTo((short)(hx + sc(kHX[0])), (short)(hy + sc(kHY[0])));
     for (i = 1; i < n; i++)
-        LineTo((short)(hx + kHX[i]), (short)(hy + kHY[i]));
-    LineTo((short)(hx + kHX[0]), (short)(hy + kHY[0]));
+        LineTo((short)(hx + sc(kHX[i])), (short)(hy + sc(kHY[i])));
+    LineTo((short)(hx + sc(kHX[0])), (short)(hy + sc(kHY[0])));
 }
 
 static void draw_hand_poly(short hx, short hy, Boolean fill)
@@ -263,17 +308,22 @@ static void draw_robot(short hx, short hy)
 {
     short i;
     short n;
+    short left;
+    short top;
+    short right;
+    short bottom;
 
     n = (short)(sizeof kRobot / sizeof kRobot[0]);
     PenNormal();
     for (i = 0; i < n; i++) {
         Rect q;
 
-        SetRect(&q,
-                (short)(hx + kRobot[i][0]),
-                (short)(hy + kRobot[i][1]),
-                (short)(hx + kRobot[i][2]),
-                (short)(hy + kRobot[i][3]));
+        /* Trap calls reject a nested call in an argument on this compiler. */
+        left = (short)(hx + sc(kRobot[i][0]));
+        top = (short)(hy + sc(kRobot[i][1]));
+        right = (short)(hx + sc(kRobot[i][2]));
+        bottom = (short)(hy + sc(kRobot[i][3]));
+        SetRect(&q, left, top, right, bottom);
         PaintRect(&q);
     }
 }
@@ -281,9 +331,13 @@ static void draw_robot(short hx, short hy)
 static void draw_laser(short hx, short hy)
 {
     Rect o;
+    short r;
 
+    r = sc(5);
+    if (r < 1)
+        r = 1;
     PenNormal();
-    SetRect(&o, (short)(hx - 5), (short)(hy - 5), (short)(hx + 6), (short)(hy + 6));
+    SetRect(&o, (short)(hx - r), (short)(hy - r), (short)(hx + r + 1), (short)(hy + r + 1));
     PaintOval(&o);
 }
 
@@ -321,10 +375,10 @@ static void build_hand(void)
     if (gHand == NULL)
         return;
     n = (short)(sizeof kHX / sizeof kHX[0]);
-    MoveTo((short)(kPolyH + kHX[0]), (short)(kPolyV + kHY[0]));
+    MoveTo((short)(kPolyH + sc(kHX[0])), (short)(kPolyV + sc(kHY[0])));
     for (i = 1; i < n; i++)
-        LineTo((short)(kPolyH + kHX[i]), (short)(kPolyV + kHY[i]));
-    LineTo((short)(kPolyH + kHX[0]), (short)(kPolyV + kHY[0]));
+        LineTo((short)(kPolyH + sc(kHX[i])), (short)(kPolyV + sc(kHY[i])));
+    LineTo((short)(kPolyH + sc(kHX[0])), (short)(kPolyV + sc(kHY[0])));
     ClosePoly();
 }
 
@@ -706,6 +760,7 @@ int main(void)
 
     init_toolbox();
     setup_menus();
+    choose_scale();
     create_window();
     if (gWin == NULL)
         return 1;
