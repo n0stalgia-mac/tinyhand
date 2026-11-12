@@ -2,7 +2,7 @@
 
 Classic Toolbox application for a 68000 Mac Plus running System 6.0.8 (512×342, 1-bit). The Swift macOS app stays in this tree. The classic app is `classic/`. Creator `tHnd`, type `APPL`.
 
-`./build.sh` configures `build-68k/` with the Retro68 toolchain and copies `dist/TinyHand-68k.bin` and `dist/TinyHand-68k.dsk`. `build-68k/` is not part of the source. `-m68000 -msoft-float` are applied only when `CMAKE_SYSTEM_NAME` is `Retro68`.
+`./build.sh` configures `build-68k/` with the Retro68 toolchain and `build-ppc/` with the RetroPPC toolchain, then copies `dist/TinyHand-68k.bin`, `dist/TinyHand-68k.dsk`, `dist/TinyHand-ppc.bin`, and `dist/TinyHand-ppc.dsk`. The build directories are not part of the source. `-m68000 -msoft-float` are applied only when `CMAKE_SYSTEM_NAME` is `Retro68`.
 
 The window is `screenBits.bounds` with the top inset by the menu bar (`GetMBarHeight`). The hand is drawn on the first paint, fingertip at the window centre, before the mouse moves. After the mouse moves inside the content, the fingertip sits on the pointer and the arrow cursor is hidden. The arrow comes back over the menu bar.
 
@@ -21,4 +21,10 @@ The window is `screenBits.bounds` with the top inset by the menu bar (`GetMBarHe
 
 ## PowerPC
 
-Not built in this run. The same `classic/CMakeLists.txt` omits the 68000 flags when `CMAKE_SYSTEM_NAME` is not `Retro68`, so a later RetroPPC configure can reuse it. Toolchain, when that task runs: `/home/grok/Retro68-build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake`.
+`./build.sh` configures `build-ppc/` with `/home/grok/Retro68-build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake`. The same `classic/src/tinyhand.c` is compiled with `-std=gnu99 -Os`. `int` is 32-bit on that compiler. The source already uses `short` and `long` for coordinates and counts, and the PowerPC link did not need a trap substitution.
+
+`TinyHand.r` is shared. Its `'SIZE' (-1)` overrides the one in `RetroPPCAPPL.r`, so the PowerPC target appends `classic/src/TinyHandPPC.r`.
+
+| Item | 68000 | PowerPC |
+| --- | --- | --- |
+| `'SIZE' (-1)` | `not32BitCompatible`, preferred 128K, minimum 64K | `is32BitCompatible`, preferred 1024K, minimum 1024K. Finder will not launch a PEF that is not 32-bit clean, and the RetroPPC partition is 1 MB. |

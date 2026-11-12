@@ -2,7 +2,7 @@
  * TinyHand for a 68000 Mac Plus, System 6.0.8, 512x342, 1-bit QuickDraw.
  *
  * Retro68's 68k int is 16-bit. Coordinates and counts are short or long.
- * The same file is meant to compile later for a classic PowerPC Mac.
+ * The same file also compiles for a classic PowerPC Mac (RetroPPC).
  * Stroke storage is a static ring, not NewPtrClear (System 7 only).
  */
 #include <Quickdraw.h>
