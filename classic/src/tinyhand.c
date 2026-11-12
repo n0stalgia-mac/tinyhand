@@ -66,29 +66,30 @@ static InkSeg gInk[kMaxSeg];
 static short gInkCount;
 static short gInkNext;
 
-/* Fingertip at (0, 0). Index up, other fingers folded, thumb to the left,
-   short stick below the wrist. */
+/* Fingertip at (0, 0). Index up on the left, other fingers folded,
+   thumb further left. The stick hangs from the wrist, to the right of
+   the index finger, so the hand sits on the top of the stick. */
 static const short kHX[] = {
-    0, 4, 4, 14, 20, 20, 14, 14, 22, 22, 14, 14, 18, 18, 12, 10,
-    8, 3, 3, -3, -3, -8, -12, -18, -18, -32, -36, -34, -20, -16, -4, -4
+    0, 5, 5, 14, 20, 20, 12, 14, 22, 22, 14, 16, 20, 18, 24, 18,
+    18, 10, 10, 0, -4, -8, -10, -28, -34, -32, -12, -6, -5, -5
 };
 static const short kHY[] = {
-    0, 2, 36, 38, 40, 48, 50, 52, 54, 64, 66, 68, 70, 80, 84, 88,
-    96, 100, 136, 136, 100, 96, 88, 80, 62, 66, 58, 48, 50, 46, 40, 2
+    0, 1, 12, 16, 18, 28, 32, 34, 38, 48, 52, 54, 64, 74, 82, 82,
+    148, 148, 82, 82, 74, 66, 58, 62, 50, 40, 38, 26, 14, 1
 };
 
 typedef char kHandAxesMatch[(sizeof kHX == sizeof kHY) ? 1 : -1];
 
 /* Same pose, separate rectangles so the robot reads as blocks. */
 static const short kRobot[][4] = {
-    {-4, 0, 5, 34},
-    {-16, 40, 11, 88},
-    {14, 40, 23, 50},
-    {14, 54, 25, 66},
-    {12, 70, 21, 82},
-    {-36, 48, -20, 66},
-    {-7, 90, 8, 100},
-    {-2, 104, 3, 136}
+    {-5, 0, 6, 14},
+    {-8, 12, 20, 78},
+    {12, 14, 22, 30},
+    {14, 34, 24, 50},
+    {14, 54, 22, 70},
+    {-34, 38, -10, 60},
+    {-2, 72, 25, 86},
+    {10, 80, 19, 148}
 };
 
 static short menu_bar_height(void)

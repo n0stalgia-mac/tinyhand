@@ -4,7 +4,7 @@ Classic Toolbox application for a 68000 Mac Plus running System 6.0.8 (512×342,
 
 `./build.sh` configures `build-68k/` with the Retro68 toolchain and `build-ppc/` with the RetroPPC toolchain, then copies `dist/TinyHand-68k.bin`, `dist/TinyHand-68k.dsk`, `dist/TinyHand-ppc.bin`, and `dist/TinyHand-ppc.dsk`. The build directories are not part of the source. `-m68000 -msoft-float` are applied only when `CMAKE_SYSTEM_NAME` is `Retro68`.
 
-The window is `screenBits.bounds` with the top inset by the menu bar (`GetMBarHeight`). The hand is drawn on the first paint, fingertip at the window centre, before the mouse moves. After the mouse moves inside the content, the fingertip sits on the pointer and the arrow cursor is hidden. The arrow comes back over the menu bar.
+The window is `screenBits.bounds` with the top inset by the menu bar (`GetMBarHeight`). The hand is drawn on the first paint, fingertip at the window centre, before the mouse moves. The outline and the robot put that hand on the top of the stick: the index finger is on the left, and the shaft hangs from the wrist to the right of the finger. After the mouse moves inside the content, the fingertip sits on the pointer and the arrow cursor is hidden. The arrow comes back over the menu bar.
 
 | Upstream (macOS Swift) | This port |
 | --- | --- |
