@@ -1,0 +1,19 @@
+The PowerPC TinyHand application was built (dist/TinyHand-ppc.bin, dist/TinyHand-ppc.dsk) and was not booted.
+
+Looked on this machine (12 Nov 2026), without downloading a ROM or a System disk:
+
+- /usr/bin/qemu-system-ppc: absent
+- /usr/bin/qemu-system-m68k: absent
+- SheepShaver: no binary at /usr/bin/SheepShaver, /usr/local/bin/SheepShaver, or /home/grok/SheepShaver
+- Basilisk II: not used for PowerPC; no BasiliskII binary found under /opt, /usr/local, /snap, or /home/grok
+- Search of /home/grok, /opt, /usr, and /usr/local for qemu-system-ppc, SheepShaver, sheepshaver, pearpc, g3beige, mac99, and MacOSROM: nothing
+- ROM files already on disk are 68k only:
+  /home/grok/nilshelf-harness/rom/1986-03 - 4D1F8172 - MacPlus v3.ROM
+  /home/grok/nilshelf-harness/rom/1987-03 - B2E362A8 - Mac SE.ROM
+  /home/grok/nilshelf-harness/rom/1988-09 - 97221136 - Mac II FDHD & IIx & IIcx.ROM
+  /home/grok/nilshelf-harness/rom/341-0868 MDC 8-24.ROM
+  /home/grok/snow-headless/roms/Plus.ROM
+- No PowerPC Mac OS ROM and no mac99 or g3beige disk image were found.
+- Snow headless models are plus, se, iix, iicx, and se30. None of those boot a CFM PowerPC application.
+
+No dist/tinyhand-ppc.png was written.
