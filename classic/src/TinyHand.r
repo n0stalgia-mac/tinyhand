@@ -68,11 +68,36 @@ resource 'DITL' (128) {
             disabled,
             "TinyHand\n"
             "\n"
-            "A hand on a stick for the Mac Plus.\n"
+            "A hand on a stick. Needs System 7.1.\n"
             "The fingertip follows the pointer.\n"
             "Drag in the window to draw ink.\n"
             "Command-drag adds an arrowhead.\n"
             "Clear is Command-C. Quit is Command-Q."
+        }
+    }
+};
+
+resource 'ALRT' (129) {
+    {60, 40, 200, 430},
+    129,
+    {
+        OK, visible, silent,
+        OK, visible, silent,
+        OK, visible, silent,
+        OK, visible, silent
+    },
+    noAutoCenter
+};
+
+resource 'DITL' (129) {
+    {
+        {110, 300, 130, 370},
+        Button { enabled, "OK" },
+
+        {10, 16, 100, 370},
+        StaticText {
+            disabled,
+            "TinyHand requires System 7.1 or later."
         }
     }
 };
@@ -130,7 +155,7 @@ data 'tHnd' (0) {
 resource 'SIZE' (-1) {
     dontSaveScreen, acceptSuspendResumeEvents, enableOptionSwitch,
     canBackground, multiFinderAware, backgroundAndForeground,
-    dontGetFrontClicks, ignoreChildDiedEvents, not32BitCompatible,
+    dontGetFrontClicks, ignoreChildDiedEvents, is32BitCompatible,
     reserved, reserved, reserved, reserved, reserved, reserved, reserved,
     128 * 1024,
     64 * 1024

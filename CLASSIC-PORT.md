@@ -1,6 +1,18 @@
 # TinyHand classic port
 
-Classic Toolbox application for a 68000 Mac Plus running System 6.0.8 (512×342, 1-bit). The Swift macOS app stays in this tree. The classic app is `classic/`. Creator `tHnd`, type `APPL`.
+Classic Toolbox application. The minimum system is System 7.1 on both 68000 and PowerPC. It draws 1-bit QuickDraw, including on a Mac Plus at 512×342. The Swift macOS app stays in this tree. The classic app is `classic/`. Creator `tHnd`, type `APPL`.
+
+## System 7.1
+
+At launch, after `InitDialogs`, the app calls `Gestalt(gestaltSystemVersion)`. That selector returns a BCD long: System 7.0.1 is `0x0701`, System 7.1 is `0x0710`, System 7.1.2 is `0x0712`. A numeric compare matches that order. If Gestalt returns an error, or the value is below `0x0710`, the app shows alert 129 ("TinyHand requires System 7.1 or later.") and quits. It does not open the window. Gestalt itself dates to System 6.0.4, so a System 6 Mac reaches the alert instead of an unimplemented trap.
+
+The Toolbox calls in `classic/src/tinyhand.c` are ones System 7.1 already has. The 68k build emits the classic A-line traps (Gestalt is `0xA1AD`, `GetMenuItemText` is `0xA946`, the original `GetItem`). `GetMBarHeight` is not a trap: on 68k it is the inline `MOVE.W $0BAA,D0` that reads the `MBarHeight` low-memory global, and on PowerPC it is the InterfaceLib 7.1 export of that same read. PowerPC `Gestalt` is the InterfaceLib 7.1 import.
+
+Managers added after System 7.1 are not used. That includes the Drag Manager (System 7.5), the Thread Manager as an app API, Appearance Manager (Mac OS 8), Navigation Services (Mac OS 8.5), Contextual Menus, Control Strip, and Apple Guide. Offscreen drawing is the window port, not `GWorld` or `QDOffscreen`.
+
+`'SIZE' (-1)` is `is32BitCompatible` on both builds. The source does not mask addresses or poke 24-bit master pointers. System 7.1 on a 68020 machine may be in 32-bit mode, and Finder will not launch the PowerPC PEF unless the flag is set. The 68000 preferred partition stays 128K, minimum 64K.
+
+Snow on a Mac IIx (System 7.1, 640×480) reaches the hand: `Gestalt` returns at least `0x0710`, so the alert is not shown. The framebuffer is `dist/tinyhand-system71.png`. On a Mac Plus running System 6.0.8 the same build stops on alert 129 (`dist/tinyhand-below-71.png`).
 
 `./build.sh` configures `build-68k/` with the Retro68 toolchain and `build-ppc/` with the RetroPPC toolchain, then copies `dist/TinyHand-68k.bin`, `dist/TinyHand-68k.dsk`, `dist/TinyHand-ppc.bin`, and `dist/TinyHand-ppc.dsk`. The build directories are not part of the source. `-m68000 -msoft-float` are applied only when `CMAKE_SYSTEM_NAME` is `Retro68`.
 
@@ -27,4 +39,4 @@ The window is `screenBits.bounds` with the top inset by the menu bar (`GetMBarHe
 
 | Item | 68000 | PowerPC |
 | --- | --- | --- |
-| `'SIZE' (-1)` | `not32BitCompatible`, preferred 128K, minimum 64K | `is32BitCompatible`, preferred 1024K, minimum 1024K. Finder will not launch a PEF that is not 32-bit clean, and the RetroPPC partition is 1 MB. |
+| `'SIZE' (-1)` | `is32BitCompatible`, preferred 128K, minimum 64K | `is32BitCompatible`, preferred 1024K, minimum 1024K. Finder will not launch a PEF that is not 32-bit clean, and the RetroPPC partition is 1 MB. |

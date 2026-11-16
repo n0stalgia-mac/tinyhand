@@ -2,7 +2,7 @@
 
 /*
  * Appended only to the PowerPC link, after TinyHand.r.
- * That file's SIZE is not32BitCompatible and 128K/64K, and it overrides
+ * That file's SIZE is 128K/64K. This resource overrides it and
  * RetroPPCAPPL.r. Finder will not launch a PEF unless SIZE is 32-bit
  * clean. The 1 MB partition is the RetroPPC crt default.
  */

@@ -1,9 +1,10 @@
 /*
- * TinyHand for a 68000 Mac Plus, System 6.0.8, 512x342, 1-bit QuickDraw.
+ * TinyHand for classic Mac OS. Minimum system is 7.1 on 68000 and PowerPC.
+ * 1-bit QuickDraw, so a Mac Plus running System 7.1 can show it.
  *
  * Retro68's 68k int is 16-bit. Coordinates and counts are short or long.
  * The same file also compiles for a classic PowerPC Mac (RetroPPC).
- * Stroke storage is a static ring, not NewPtrClear (System 7 only).
+ * Stroke storage is a static ring.
  */
 #include <Quickdraw.h>
 #include <Windows.h>
@@ -16,12 +17,17 @@
 #include <ToolUtils.h>
 #include <OSUtils.h>
 #include <Sound.h>
+#include <Gestalt.h>
 
 #define kAppleMenu 128
 #define kFileMenu 129
 #define kHandMenu 130
 #define kSoundMenu 131
 #define kAboutAlert 128
+#define kOldSystemAlert 129
+
+/* gestaltSystemVersion is BCD. 7.0.1 is 0x0701, 7.1 is 0x0710, 7.1.2 is 0x0712. */
+#define kMinSystemVersion 0x0710L
 
 #define kAboutItem 1
 #define kClearItem 1
@@ -678,6 +684,22 @@ static void handle_event(EventRecord *e)
     }
 }
 
+/* True when Gestalt reports System 7.1 or newer. A missing selector or any
+   other error is treated as too old: the caller shows the alert and quits. */
+static Boolean system_is_supported(void)
+{
+    long version;
+    OSErr err;
+
+    version = 0;
+    err = Gestalt(gestaltSystemVersion, &version);
+    if (err != noErr)
+        return false;
+    if (version < kMinSystemVersion)
+        return false;
+    return true;
+}
+
 static void init_toolbox(void)
 {
     MaxApplZone();
@@ -759,6 +781,10 @@ int main(void)
     gBeep = true;
 
     init_toolbox();
+    if (!system_is_supported()) {
+        (void)Alert(kOldSystemAlert, NULL);
+        return 0;
+    }
     setup_menus();
     choose_scale();
     create_window();
