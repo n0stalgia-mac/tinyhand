@@ -1,6 +1,8 @@
 /*
  * TinyHand for classic Mac OS. Minimum system is 7.1 on 68000 and PowerPC.
  * 1-bit QuickDraw, so a Mac Plus running System 7.1 can show it.
+ * The hand is drawn on the Window Manager port. There is no full-screen
+ * window, so the desktop and other applications stay visible.
  *
  * Retro68's 68k int is 16-bit. Coordinates and counts are short or long.
  * The same file also compiles for a classic PowerPC Mac (RetroPPC).
@@ -18,6 +20,7 @@
 #include <OSUtils.h>
 #include <Sound.h>
 #include <Gestalt.h>
+#include <MacMemory.h>
 
 #define kAppleMenu 128
 #define kFileMenu 129
@@ -64,21 +67,32 @@ typedef struct InkSeg {
     short arrow;
 } InkSeg;
 
-static const unsigned char kWinTitle[] = "\pTinyHand";
-
-static WindowPtr gWin;
 static Boolean gDone;
 static Boolean gBeep;
 static Boolean gCursorHidden;
 static Boolean gDragging;
 static Boolean gDragMoved;
 static Boolean gMouseMoved;
+static Boolean gDirty;
+static Boolean gSuspended;
+static Boolean gSaveValid;
+static Boolean gClipOpen;
+static Boolean gPresenting;
 static short gStyle;
+static short gDepth;
 static Point gHot;
 static Point gAnchor;
 static Point gLastInk;
 static Point gLastGlobal;
 static PolyHandle gHand;
+static GrafPtr gOverlay;
+static RgnHandle gClipSave;
+static RgnHandle gVisSave;
+static Ptr gSaveBase;
+static long gSaveSize;
+static Rect gSaveRect;
+static BitMap gSaveBits;
+static PixMap gSavePix;
 
 static InkSeg gInk[kMaxSeg];
 static short gInkCount;
@@ -180,8 +194,7 @@ static void ink_clear(void)
 {
     gInkCount = 0;
     gInkNext = 0;
-    if (gWin != NULL)
-        InvalRect(&gWin->portRect);
+    gDirty = true;
 }
 
 static void ink_add(short x0, short y0, short x1, short y1)
@@ -359,14 +372,266 @@ static void draw_hand(short hx, short hy)
         draw_hand_poly(hx, hy, false);
 }
 
-static void draw_all(void)
+/* The Window Manager port is global. A color port stores a PixMapHandle
+   where a GrafPort stores baseAddr, and a negative word where rowBytes
+   would be. Both layouts put visRgn and clipRgn at the same offsets.
+   Packed to 2 so the offsets match the Toolbox on 68k and PowerPC. */
+#pragma pack(push, 2)
+struct PortHead {
+    short device;
+    Ptr ref;
+    short marker;
+};
+#pragma pack(pop)
+
+static Boolean port_is_color(GrafPtr port)
 {
-    if (gWin == NULL)
+    return ((struct PortHead *)port)->marker < 0;
+}
+
+static BitMap *screen_bits(GrafPtr port)
+{
+    PixMapHandle pm;
+
+    if (!port_is_color(port))
+        return &port->portBits;
+    pm = (PixMapHandle)((struct PortHead *)port)->ref;
+    if (pm == NULL || *pm == NULL)
+        return &port->portBits;
+    return (BitMap *)(*pm);
+}
+
+static short read_depth(GrafPtr port)
+{
+    PixMapHandle pm;
+    short depth;
+
+    if (!port_is_color(port))
+        return 1;
+    pm = (PixMapHandle)((struct PortHead *)port)->ref;
+    if (pm == NULL || *pm == NULL)
+        return 1;
+    depth = (*pm)->pixelSize;
+    if (depth != 1 && depth != 2 && depth != 4 && depth != 8 && depth != 16 && depth != 32)
+        return 1;
+    return depth;
+}
+
+static void content_rect(Rect *r)
+{
+    *r = qd.screenBits.bounds;
+    r->top = (short)(r->top + menu_bar_height());
+    if (r->top > r->bottom)
+        r->top = r->bottom;
+}
+
+static void union_point(Rect *r, short x, short y)
+{
+    if (x < r->left)
+        r->left = x;
+    if ((short)(x + 1) > r->right)
+        r->right = (short)(x + 1);
+    if (y < r->top)
+        r->top = y;
+    if ((short)(y + 1) > r->bottom)
+        r->bottom = (short)(y + 1);
+}
+
+/* Bounds of every pixel draw_hand and draw_ink can touch, in global
+   coordinates, padded for the pen and the arrowhead. */
+static void content_bounds(Rect *r)
+{
+    Rect limit;
+    short n;
+    short i;
+    short idx;
+    short pad;
+    short rad;
+
+    n = (short)(sizeof kHX / sizeof kHX[0]);
+    r->left = gHot.h;
+    r->right = (short)(gHot.h + 1);
+    r->top = gHot.v;
+    r->bottom = (short)(gHot.v + 1);
+    for (i = 0; i < n; i++)
+        union_point(r, (short)(gHot.h + sc(kHX[i])), (short)(gHot.v + sc(kHY[i])));
+    union_point(r, (short)(gHot.h + sc(-34)), (short)(gHot.v + sc(0)));
+    union_point(r, (short)(gHot.h + sc(25)), (short)(gHot.v + sc(148)));
+    if (gStyle == kStyleLaser) {
+        rad = sc(5);
+        if (rad < 1)
+            rad = 1;
+        union_point(r, (short)(gHot.h - rad), (short)(gHot.v - rad));
+        union_point(r, (short)(gHot.h + rad + 1), (short)(gHot.v + rad + 1));
+    }
+    n = gInkCount;
+    if (n > 0) {
+        if (n < kMaxSeg)
+            idx = 0;
+        else
+            idx = gInkNext;
+        for (i = 0; i < n; i++) {
+            union_point(r, gInk[idx].x0, gInk[idx].y0);
+            union_point(r, gInk[idx].x1, gInk[idx].y1);
+            idx = (short)((idx + 1) & (kMaxSeg - 1));
+        }
+    }
+    pad = 16;
+    r->left = (short)(r->left - pad);
+    r->top = (short)(r->top - pad);
+    r->right = (short)(r->right + pad);
+    r->bottom = (short)(r->bottom + pad);
+    content_rect(&limit);
+    if (!SectRect(r, &limit, r))
+        SetRect(r, 0, 0, 0, 0);
+}
+
+static void screen_begin(void)
+{
+    Rect r;
+
+    if (gOverlay == NULL || gClipSave == NULL || gVisSave == NULL)
         return;
-    SetPort(gWin);
-    EraseRect(&gWin->portRect);
-    draw_ink();
-    draw_hand(gHot.h, gHot.v);
+    SetPort(gOverlay);
+    if (gClipOpen)
+        return;
+    CopyRgn(gOverlay->clipRgn, gClipSave);
+    CopyRgn(gOverlay->visRgn, gVisSave);
+    content_rect(&r);
+    RectRgn(gOverlay->clipRgn, &r);
+    RectRgn(gOverlay->visRgn, &r);
+    gClipOpen = true;
+    PenNormal();
+}
+
+static void screen_end(void)
+{
+    if (!gClipOpen || gOverlay == NULL)
+        return;
+    SetPort(gOverlay);
+    CopyRgn(gClipSave, gOverlay->clipRgn);
+    CopyRgn(gVisSave, gOverlay->visRgn);
+    gClipOpen = false;
+}
+
+static short row_bytes_for(short width, short depth)
+{
+    long bits;
+    long rb;
+
+    if (width < 1)
+        width = 1;
+    if (depth < 1)
+        depth = 1;
+    bits = (long)width * (long)depth;
+    rb = (bits + 15L) >> 4;
+    rb <<= 1;
+    if (rb < 2L)
+        rb = 2L;
+    return (short)rb;
+}
+
+static BitMap *save_bitmap(void)
+{
+    if (gDepth == 1)
+        return &gSaveBits;
+    return (BitMap *)&gSavePix;
+}
+
+static void prepare_offscreen(const Rect *r)
+{
+    short w;
+    short h;
+    short rb;
+    long bytes;
+    BitMap *src;
+
+    w = (short)(r->right - r->left);
+    h = (short)(r->bottom - r->top);
+    if (w < 1 || h < 1) {
+        gSaveValid = false;
+        return;
+    }
+    rb = row_bytes_for(w, gDepth);
+    bytes = (long)rb * (long)h;
+    if (gSaveBase == NULL || bytes != gSaveSize) {
+        if (gSaveBase != NULL)
+            DisposePtr(gSaveBase);
+        gSaveBase = NewPtr(bytes);
+        gSaveSize = 0;
+        gSaveValid = false;
+        if (gSaveBase == NULL)
+            return;
+        gSaveSize = bytes;
+    }
+    if (gDepth == 1) {
+        gSaveBits.baseAddr = gSaveBase;
+        gSaveBits.rowBytes = rb;
+        gSaveBits.bounds = *r;
+        return;
+    }
+    src = screen_bits(gOverlay);
+    gSavePix = *(PixMap *)src;
+    gSavePix.baseAddr = gSaveBase;
+    gSavePix.bounds = *r;
+    gSavePix.rowBytes = (short)(rb | (short)0x8000);
+}
+
+static void copy_under(Boolean toSave)
+{
+    BitMap *screen;
+    BitMap *save;
+    Rect r;
+
+    if (gSaveBase == NULL || gOverlay == NULL)
+        return;
+    screen = screen_bits(gOverlay);
+    save = save_bitmap();
+    r = gSaveRect;
+    if (toSave)
+        CopyBits(screen, save, &r, &r, srcCopy, NULL);
+    else
+        CopyBits(save, screen, &r, &r, srcCopy, NULL);
+}
+
+static void restore_under(void)
+{
+    if (!gSaveValid)
+        return;
+    screen_begin();
+    copy_under(false);
+    gSaveValid = false;
+    screen_end();
+}
+
+/* Draw only the hand, the stick, and the ink. The pixels underneath are
+   copied aside first and put back when the drawing moves, so the desktop
+   and other applications stay visible. There is no full-screen window. */
+static void present(void)
+{
+    Rect bounds;
+
+    if (gOverlay == NULL || gPresenting)
+        return;
+    gPresenting = true;
+    gDirty = false;
+    screen_begin();
+    if (gSaveValid)
+        copy_under(false);
+    gSaveValid = false;
+    content_bounds(&bounds);
+    if (!EmptyRect(&bounds)) {
+        gSaveRect = bounds;
+        prepare_offscreen(&bounds);
+        if (gSaveBase != NULL) {
+            copy_under(true);
+            gSaveValid = true;
+        }
+        draw_ink();
+        draw_hand(gHot.h, gHot.v);
+    }
+    screen_end();
+    gPresenting = false;
 }
 
 static void build_hand(void)
@@ -374,18 +639,22 @@ static void build_hand(void)
     short n;
     short i;
 
-    if (gWin == NULL)
+    if (gOverlay == NULL)
         return;
-    SetPort(gWin);
+    /* Widen the port or the template polygon is clipped to the desktop. */
+    screen_begin();
     gHand = OpenPoly();
-    if (gHand == NULL)
+    if (gHand == NULL) {
+        screen_end();
         return;
+    }
     n = (short)(sizeof kHX / sizeof kHX[0]);
     MoveTo((short)(kPolyH + sc(kHX[0])), (short)(kPolyV + sc(kHY[0])));
     for (i = 1; i < n; i++)
         LineTo((short)(kPolyH + sc(kHX[i])), (short)(kPolyV + sc(kHY[i])));
     LineTo((short)(kPolyH + sc(kHX[0])), (short)(kPolyV + sc(kHY[0])));
     ClosePoly();
+    screen_end();
 }
 
 static void sync_style_checks(void)
@@ -404,8 +673,7 @@ static void set_style(short style)
 {
     gStyle = style;
     sync_style_checks();
-    if (gWin != NULL)
-        InvalRect(&gWin->portRect);
+    gDirty = true;
 }
 
 static void toggle_beep(void)
@@ -460,8 +728,7 @@ static void place_hand(Point local)
     if (local.h == gHot.h && local.v == gHot.v)
         return;
     gHot = local;
-    if (gWin != NULL)
-        InvalRect(&gWin->portRect);
+    gDirty = true;
 }
 
 static void extend_ink(Point cur)
@@ -477,25 +744,23 @@ static void extend_ink(Point cur)
         ink_add(gAnchor.h, gAnchor.v, cur.h, cur.v);
         gDragMoved = true;
         gLastInk = cur;
-        if (gWin != NULL)
-            InvalRect(&gWin->portRect);
+        gDirty = true;
         return;
     }
     if (cur.h == gLastInk.h && cur.v == gLastInk.v)
         return;
     ink_add(gLastInk.h, gLastInk.v, cur.h, cur.v);
     gLastInk = cur;
-    if (gWin != NULL)
-        InvalRect(&gWin->portRect);
+    gDirty = true;
 }
 
 static void end_drag(const EventRecord *e)
 {
     Point cur;
 
-    if (!gDragging || gWin == NULL)
+    if (!gDragging || gOverlay == NULL)
         return;
-    SetPort(gWin);
+    SetPort(gOverlay);
     GetMouse(&cur);
     gMouseMoved = true;
     place_hand(cur);
@@ -507,104 +772,80 @@ static void end_drag(const EventRecord *e)
         SysBeep(30);
     }
     gDragging = false;
-    InvalRect(&gWin->portRect);
+    gDirty = true;
 }
 
-static Boolean point_in_content(Point local)
+static Boolean point_in_content(Point global)
 {
-    if (gWin == NULL)
-        return false;
-    if (local.h < gWin->portRect.left || local.h >= gWin->portRect.right)
-        return false;
-    if (local.v < gWin->portRect.top || local.v >= gWin->portRect.bottom)
-        return false;
-    return true;
+    Rect r;
+
+    content_rect(&r);
+    return PtInRect(global, &r);
 }
 
 static void track_mouse(void)
 {
-    Point local;
     Point global;
     short mbar;
     Boolean moved;
     Boolean inContent;
 
-    if (gWin == NULL)
+    if (gOverlay == NULL || gSuspended)
         return;
-    if (FrontWindow() != gWin) {
-        show_arrow();
-        return;
-    }
-    SetPort(gWin);
-    GetMouse(&local);
-    global = local;
-    LocalToGlobal(&global);
+    SetPort(gOverlay);
+    GetMouse(&global);
     moved = (global.h != gLastGlobal.h || global.v != gLastGlobal.v);
     gLastGlobal = global;
     if (moved)
         gMouseMoved = true;
 
     mbar = menu_bar_height();
-    inContent = point_in_content(local);
+    inContent = point_in_content(global);
     if (global.v < mbar)
         show_arrow();
     else if (inContent)
         hide_arrow();
 
     if (gDragging) {
-        place_hand(local);
-        extend_ink(local);
+        place_hand(global);
+        extend_ink(global);
         return;
     }
     if (gMouseMoved && global.v >= mbar && inContent)
-        place_hand(local);
+        place_hand(global);
 }
 
 static void handle_mouse_down(EventRecord *e)
 {
     WindowPtr wp;
     short part;
-    Point local;
-    Rect limit;
+    Point global;
 
     part = FindWindow(e->where, &wp);
     if (part == inMenuBar) {
         InitCursor();
         gCursorHidden = false;
         do_menu(MenuSelect(e->where));
+        gDirty = true;
         return;
     }
     if (part == inSysWindow) {
         SystemClick(e, wp);
         return;
     }
-    if (wp != gWin)
+    /* No covering window: a click on the desktop is inDesk. It still
+       draws ink here, while this app is in front. */
+    if (part != inDesk && part != inContent)
         return;
-    if (part == inGoAway) {
-        if (TrackGoAway(gWin, e->where))
-            gDone = true;
+    global = e->where;
+    if (!point_in_content(global))
         return;
-    }
-    if (part == inDrag) {
-        limit = qd.screenBits.bounds;
-        limit.top = (short)(limit.top + menu_bar_height());
-        DragWindow(gWin, e->where, &limit);
-        return;
-    }
-    if (part != inContent)
-        return;
-
-    if (FrontWindow() != gWin)
-        SelectWindow(gWin);
-    SetPort(gWin);
-    local = e->where;
-    GlobalToLocal(&local);
     gDragging = true;
     gDragMoved = false;
     gMouseMoved = true;
-    gAnchor = local;
-    gLastInk = local;
-    place_hand(local);
+    gAnchor = global;
+    gLastInk = global;
+    place_hand(global);
 }
 
 static void handle_key(EventRecord *e)
@@ -656,27 +897,16 @@ static void handle_event(EventRecord *e)
     case autoKey:
         handle_key(e);
         break;
-    case updateEvt:
-        if ((WindowPtr)e->message == gWin) {
-            BeginUpdate(gWin);
-            draw_all();
-            EndUpdate(gWin);
-        }
-        break;
-    case activateEvt:
-        if ((WindowPtr)e->message == gWin) {
-            if (e->modifiers & activeFlag)
-                InvalRect(&gWin->portRect);
-            else
-                show_arrow();
-        }
-        break;
     case osEvt:
         if (((e->message >> 24) & 0xFF) == suspendResumeMessage) {
-            if (e->message & resumeFlag)
-                InvalRect(&gWin->portRect);
-            else
+            if (e->message & resumeFlag) {
+                gSuspended = false;
+                gDirty = true;
+            } else {
+                gSuspended = true;
+                restore_under();
                 show_arrow();
+            }
         }
         break;
     default:
@@ -736,35 +966,27 @@ static void setup_menus(void)
         CheckItem(sound, kBeepItem, true);
 }
 
-static void create_window(void)
+static void init_overlay(void)
 {
     Rect r;
-    short w;
-    short h;
 
-    r = qd.screenBits.bounds;
-    r.top = (short)(r.top + menu_bar_height());
-    gWin = NewWindow(NULL, &r, kWinTitle, true, plainDBox,
-                     (WindowPtr)-1, false, 0);
-    if (gWin == NULL)
+    GetWMgrPort(&gOverlay);
+    if (gOverlay == NULL)
         return;
-    SetPort(gWin);
-    w = (short)(gWin->portRect.right - gWin->portRect.left);
-    h = (short)(gWin->portRect.bottom - gWin->portRect.top);
-    gHot.h = (short)(gWin->portRect.left + w / 2);
-    gHot.v = (short)(gWin->portRect.top + h / 2);
+    gClipSave = NewRgn();
+    gVisSave = NewRgn();
+    gDepth = read_depth(gOverlay);
+    content_rect(&r);
+    gHot.h = (short)(r.left + (short)((r.right - r.left) / 2));
+    gHot.v = (short)(r.top + (short)((r.bottom - r.top) / 2));
 }
 
 static void note_launch_mouse(void)
 {
-    Point local;
-
-    if (gWin == NULL)
+    if (gOverlay == NULL)
         return;
-    SetPort(gWin);
-    GetMouse(&local);
-    gLastGlobal = local;
-    LocalToGlobal(&gLastGlobal);
+    SetPort(gOverlay);
+    GetMouse(&gLastGlobal);
     gMouseMoved = false;
 }
 
@@ -779,6 +1001,7 @@ int main(void)
     gInkNext = 0;
     gStyle = kStyleOutline;
     gBeep = true;
+    gDepth = 1;
 
     init_toolbox();
     if (!system_is_supported()) {
@@ -787,24 +1010,31 @@ int main(void)
     }
     setup_menus();
     choose_scale();
-    create_window();
-    if (gWin == NULL)
+    init_overlay();
+    if (gOverlay == NULL)
         return 1;
     build_hand();
     note_launch_mouse();
     /* Paint before the first event so a fresh launch already shows the hand. */
-    draw_all();
+    present();
 
     while (!gDone) {
         if (GetNextEvent(everyEvent, &e))
             handle_event(&e);
         track_mouse();
+        if (gDirty && !gSuspended)
+            present();
     }
 
+    restore_under();
     show_arrow();
     if (gHand != NULL)
         KillPoly(gHand);
-    if (gWin != NULL)
-        DisposeWindow(gWin);
+    if (gSaveBase != NULL)
+        DisposePtr(gSaveBase);
+    if (gClipSave != NULL)
+        DisposeRgn(gClipSave);
+    if (gVisSave != NULL)
+        DisposeRgn(gVisSave);
     return 0;
 }
