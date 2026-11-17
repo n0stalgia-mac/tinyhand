@@ -1,8 +1,9 @@
 /*
  * TinyHand for classic Mac OS. Minimum system is 7.1 on 68000 and PowerPC.
  * 1-bit QuickDraw, so a Mac Plus running System 7.1 can show it.
- * The hand is drawn on the Window Manager port. There is no full-screen
- * window, so the desktop and other applications stay visible.
+ * The hand is drawn on the Window Manager port. A plain window covers the
+ * desktop only while drawing is on, so clicks hit this app. That window is
+ * not erased, so other applications stay visible. Drawing off hides it.
  *
  * Retro68's 68k int is 16-bit. Coordinates and counts are short or long.
  * The same file also compiles for a classic PowerPC Mac (RetroPPC).
@@ -26,6 +27,7 @@
 #define kFileMenu 129
 #define kHandMenu 130
 #define kSoundMenu 131
+#define kDrawMenu 132
 #define kAboutAlert 128
 #define kOldSystemAlert 129
 
@@ -36,6 +38,12 @@
 #define kClearItem 1
 #define kQuitItem 3
 #define kBeepItem 1
+#define kDrawItem 1
+
+/* ANSI 'H' on the classic keyboard. ctrl-option-H matches the macOS app.
+   Command-H is the menu equivalent, because a MENU resource can only
+   show the command key. */
+#define kKeyH 0x04
 
 #define kStyleOutline 1
 #define kStyleSolid 2
@@ -69,6 +77,7 @@ typedef struct InkSeg {
 
 static Boolean gDone;
 static Boolean gBeep;
+static Boolean gDrawing;
 static Boolean gCursorHidden;
 static Boolean gDragging;
 static Boolean gDragMoved;
@@ -78,6 +87,7 @@ static Boolean gSuspended;
 static Boolean gSaveValid;
 static Boolean gClipOpen;
 static Boolean gPresenting;
+static Boolean gShieldShown;
 static short gStyle;
 static short gDepth;
 static Point gHot;
@@ -86,6 +96,8 @@ static Point gLastInk;
 static Point gLastGlobal;
 static PolyHandle gHand;
 static GrafPtr gOverlay;
+static WindowPtr gShield;
+static WindowRecord gShieldRec;
 static RgnHandle gClipSave;
 static RgnHandle gVisSave;
 static Ptr gSaveBase;
@@ -93,6 +105,15 @@ static long gSaveSize;
 static Rect gSaveRect;
 static BitMap gSaveBits;
 static PixMap gSavePix;
+
+/* Full desktop under the click shield. ShowHide fills that window white,
+   so this copy goes back on the screen immediately afterwards. */
+static Ptr gDeskBase;
+static long gDeskSize;
+static Rect gDeskRect;
+static BitMap gDeskBits;
+static PixMap gDeskPix;
+static Boolean gDeskValid;
 
 static InkSeg gInk[kMaxSeg];
 static short gInkCount;
@@ -604,6 +625,80 @@ static void restore_under(void)
     screen_end();
 }
 
+static BitMap *desk_bitmap(void)
+{
+    if (gDepth == 1)
+        return &gDeskBits;
+    return (BitMap *)&gDeskPix;
+}
+
+/* Copy the content area, including pixels owned by other applications.
+   screen_begin opens the Window Manager clip so the Finder window is included. */
+static void snapshot_desktop(void)
+{
+    Rect r;
+    short w;
+    short h;
+    short rb;
+    long bytes;
+    BitMap *src;
+    BitMap *dst;
+
+    gDeskValid = false;
+    if (gOverlay == NULL || gClipSave == NULL)
+        return;
+    content_rect(&r);
+    w = (short)(r.right - r.left);
+    h = (short)(r.bottom - r.top);
+    if (w < 1 || h < 1)
+        return;
+    rb = row_bytes_for(w, gDepth);
+    bytes = (long)rb * (long)h;
+    if (gDeskBase == NULL || bytes != gDeskSize) {
+        if (gDeskBase != NULL)
+            DisposePtr(gDeskBase);
+        gDeskBase = NewPtr(bytes);
+        gDeskSize = 0;
+        if (gDeskBase == NULL)
+            return;
+        gDeskSize = bytes;
+    }
+    if (gDepth == 1) {
+        gDeskBits.baseAddr = gDeskBase;
+        gDeskBits.rowBytes = rb;
+        gDeskBits.bounds = r;
+    } else {
+        src = screen_bits(gOverlay);
+        gDeskPix = *(PixMap *)src;
+        gDeskPix.baseAddr = gDeskBase;
+        gDeskPix.bounds = r;
+        gDeskPix.rowBytes = (short)(rb | (short)0x8000);
+    }
+    gDeskRect = r;
+    src = screen_bits(gOverlay);
+    dst = desk_bitmap();
+    screen_begin();
+    CopyBits(src, dst, &r, &r, srcCopy, NULL);
+    screen_end();
+    gDeskValid = true;
+}
+
+static void restore_desktop(void)
+{
+    BitMap *src;
+    BitMap *dst;
+    Rect r;
+
+    if (!gDeskValid || gDeskBase == NULL || gOverlay == NULL)
+        return;
+    src = desk_bitmap();
+    dst = screen_bits(gOverlay);
+    r = gDeskRect;
+    screen_begin();
+    CopyBits(src, dst, &r, &r, srcCopy, NULL);
+    screen_end();
+}
+
 /* Draw only the hand, the stick, and the ink. The pixels underneath are
    copied aside first and put back when the drawing moves, so the desktop
    and other applications stay visible. There is no full-screen window. */
@@ -611,7 +706,7 @@ static void present(void)
 {
     Rect bounds;
 
-    if (gOverlay == NULL || gPresenting)
+    if (gOverlay == NULL || gPresenting || !gDrawing || gSuspended)
         return;
     gPresenting = true;
     gDirty = false;
@@ -686,6 +781,102 @@ static void toggle_beep(void)
         CheckItem(menu, kBeepItem, gBeep);
 }
 
+/* The item names the action. Drawing on shows "Draw Off". */
+static void sync_draw_item(void)
+{
+    MenuHandle menu;
+
+    menu = GetMenuHandle(kDrawMenu);
+    if (menu == NULL)
+        return;
+    if (gDrawing)
+        SetMenuItemText(menu, kDrawItem, "\pDraw Off");
+    else
+        SetMenuItemText(menu, kDrawItem, "\pDraw On");
+}
+
+/* plainDBox frames its bounds with one pixel and insets the hit area.
+   Shift that frame into the menu bar and past the screen edges. */
+static void shield_bounds(Rect *r)
+{
+    Rect screen;
+    short mbar;
+
+    screen = qd.screenBits.bounds;
+    mbar = menu_bar_height();
+    r->left = (short)(screen.left - 1);
+    r->top = (short)(mbar - 1);
+    r->right = (short)(screen.right + 1);
+    r->bottom = (short)(screen.bottom + 1);
+}
+
+static void create_shield(void)
+{
+    Rect r;
+
+    if (gShield != NULL)
+        return;
+    shield_bounds(&r);
+    gShield = NewWindow(&gShieldRec, &r, "\pTinyHand", false, plainDBox,
+                        (WindowPtr)-1, false, 0);
+}
+
+static void snapshot_desktop(void);
+static void restore_desktop(void);
+
+/* ShowHide fills a new window white. Copy the screen aside first and put
+   it back after the window is in front, so other applications stay visible.
+   FindWindow then reports clicks here as inContent. */
+static void show_shield(void)
+{
+    if (gShield == NULL || gShieldShown)
+        return;
+    snapshot_desktop();
+    ShowHide(gShield, true);
+    SelectWindow(gShield);
+    gShieldShown = true;
+    restore_desktop();
+}
+
+static void hide_shield(void)
+{
+    if (gShield == NULL || !gShieldShown)
+        return;
+    ShowHide(gShield, false);
+    gShieldShown = false;
+}
+
+static Boolean point_in_content(Point global);
+
+static void set_drawing(Boolean on)
+{
+    Point global;
+
+    if (on == gDrawing)
+        return;
+    if (!on) {
+        gDragging = false;
+        restore_under();
+        show_arrow();
+        hide_shield();
+        gDrawing = false;
+        gDirty = false;
+        sync_draw_item();
+        return;
+    }
+    gDrawing = true;
+    sync_draw_item();
+    show_shield();
+    if (gOverlay != NULL && !gSuspended) {
+        SetPort(gOverlay);
+        GetMouse(&global);
+        gLastGlobal = global;
+        if (point_in_content(global))
+            gHot = global;
+    }
+    gDirty = true;
+}
+
 static void do_menu(long result)
 {
     short menu;
@@ -716,6 +907,10 @@ static void do_menu(long result)
     case kSoundMenu:
         if (item == kBeepItem)
             toggle_beep();
+        break;
+    case kDrawMenu:
+        if (item == kDrawItem)
+            set_drawing((Boolean)!gDrawing);
         break;
     default:
         break;
@@ -790,7 +985,7 @@ static void track_mouse(void)
     Boolean moved;
     Boolean inContent;
 
-    if (gOverlay == NULL || gSuspended)
+    if (gOverlay == NULL || gSuspended || !gDrawing)
         return;
     SetPort(gOverlay);
     GetMouse(&global);
@@ -826,16 +1021,20 @@ static void handle_mouse_down(EventRecord *e)
         InitCursor();
         gCursorHidden = false;
         do_menu(MenuSelect(e->where));
-        gDirty = true;
+        if (gDrawing && !gSuspended)
+            gDirty = true;
         return;
     }
     if (part == inSysWindow) {
         SystemClick(e, wp);
         return;
     }
-    /* No covering window: a click on the desktop is inDesk. It still
-       draws ink here, while this app is in front. */
-    if (part != inDesk && part != inContent)
+    /* The shield window owns clicks below the menu bar while drawing is
+       on. An inDesk click belongs to another application; leaving it
+       unhandled lets the Process Manager deliver it. */
+    if (!gDrawing || gSuspended)
+        return;
+    if (part != inContent || wp != gShield)
         return;
     global = e->where;
     if (!point_in_content(global))
@@ -856,6 +1055,12 @@ static void handle_key(EventRecord *e)
 
     ch = (char)(e->message & charCodeMask);
     code = (short)((e->message >> 8) & 0xFF);
+    if ((e->modifiers & (controlKey | optionKey)) == (controlKey | optionKey)
+        && (e->modifiers & cmdKey) == 0
+        && code == kKeyH) {
+        set_drawing((Boolean)!gDrawing);
+        return;
+    }
     if (e->modifiers & cmdKey) {
         if (ch == '.' || code == 0x2F) {
             gDone = true;
@@ -901,11 +1106,31 @@ static void handle_event(EventRecord *e)
         if (((e->message >> 24) & 0xFF) == suspendResumeMessage) {
             if (e->message & resumeFlag) {
                 gSuspended = false;
-                gDirty = true;
+                if (gDrawing) {
+                    show_shield();
+                    gDirty = true;
+                }
             } else {
                 gSuspended = true;
+                gDragging = false;
                 restore_under();
                 show_arrow();
+                hide_shield();
+            }
+        }
+        break;
+    case updateEvt:
+        /* BeginUpdate can erase the shield. Put the desktop back, then the
+           hand. ValidRect stops that CopyBits from queuing another update,
+           which would wipe the hand again before the next present. */
+        if (gShield != NULL && (WindowPtr)e->message == gShield && !gClipOpen) {
+            BeginUpdate(gShield);
+            EndUpdate(gShield);
+            if (gDrawing && !gSuspended) {
+                restore_desktop();
+                present();
+                SetPort(gShield);
+                ValidRect(&gShield->portRect);
             }
         }
         break;
@@ -961,6 +1186,7 @@ static void setup_menus(void)
     gStyle = kStyleOutline;
     gBeep = true;
     sync_style_checks();
+    sync_draw_item();
     sound = GetMenuHandle(kSoundMenu);
     if (sound != NULL)
         CheckItem(sound, kBeepItem, true);
@@ -976,6 +1202,7 @@ static void init_overlay(void)
     gClipSave = NewRgn();
     gVisSave = NewRgn();
     gDepth = read_depth(gOverlay);
+    create_shield();
     content_rect(&r);
     gHot.h = (short)(r.left + (short)((r.right - r.left) / 2));
     gHot.v = (short)(r.top + (short)((r.bottom - r.top) / 2));
@@ -995,6 +1222,7 @@ int main(void)
     EventRecord e;
 
     gDone = false;
+    gDrawing = true;
     gCursorHidden = false;
     gDragging = false;
     gInkCount = 0;
@@ -1015,15 +1243,46 @@ int main(void)
         return 1;
     build_hand();
     note_launch_mouse();
-    /* Paint before the first event so a fresh launch already shows the hand. */
-    present();
+    /* ShowHide fills the shield white. show_shield puts the desktop back.
+       The update event's BeginUpdate can erase it again, so paint the hand
+       after that update has been handled. */
+    show_shield();
+    {
+        EventRecord u;
+        short n;
+
+        for (n = 0; n < 8; n++) {
+            if (!GetNextEvent(updateMask, &u))
+                break;
+            if (gShield != NULL && (WindowPtr)u.message == gShield)
+                handle_event(&u);
+        }
+    }
+    if (gDrawing) {
+        Point global;
+
+        SetPort(gOverlay);
+        GetMouse(&global);
+        gLastGlobal = global;
+        if (point_in_content(global))
+            gHot = global;
+        hide_arrow();
+        gDirty = true;
+        present();
+    }
 
     while (!gDone) {
-        if (GetNextEvent(everyEvent, &e))
+        if (gDrawing && !gSuspended) {
+            if (GetNextEvent(everyEvent, &e))
+                handle_event(&e);
+            track_mouse();
+            if (gDirty && gDrawing && !gSuspended)
+                present();
+        } else if (WaitNextEvent(everyEvent, &e, 12, NULL)) {
             handle_event(&e);
-        track_mouse();
-        if (gDirty && !gSuspended)
-            present();
+            if (gDirty && gDrawing && !gSuspended)
+                present();
+        }
     }
 
     restore_under();
@@ -1032,6 +1291,8 @@ int main(void)
         KillPoly(gHand);
     if (gSaveBase != NULL)
         DisposePtr(gSaveBase);
+    if (gDeskBase != NULL)
+        DisposePtr(gDeskBase);
     if (gClipSave != NULL)
         DisposeRgn(gClipSave);
     if (gVisSave != NULL)

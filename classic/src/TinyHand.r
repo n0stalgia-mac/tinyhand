@@ -21,6 +21,16 @@ resource 'MENU' (129) {
     }
 };
 
+resource 'MENU' (132) {
+    132, textMenuProc,
+    allEnabled, enabled,
+    "Draw",
+    {
+        /* Drawing starts on, so the item names the action. Command-H toggles. */
+        "Draw Off", noIcon, "H", noMark, plain
+    }
+};
+
 resource 'MENU' (130) {
     130, textMenuProc,
     allEnabled, enabled,
@@ -43,7 +53,7 @@ resource 'MENU' (131) {
 };
 
 resource 'MBAR' (128) {
-    { 128, 129, 130, 131 }
+    { 128, 129, 132, 130, 131 }
 };
 
 resource 'ALRT' (128) {
@@ -69,9 +79,9 @@ resource 'DITL' (128) {
             "TinyHand\n"
             "\n"
             "A hand on a stick. Needs System 7.1.\n"
-            "The fingertip follows the pointer.\n"
-            "Drag in the window to draw ink.\n"
-            "Command-drag adds an arrowhead.\n"
+            "Drag to draw. Command-drag adds an arrow.\n"
+            "The Draw menu, or Command-H, turns drawing off.\n"
+            "Drawing off sends clicks to other programs.\n"
             "Clear is Command-C. Quit is Command-Q."
         }
     }
@@ -157,8 +167,8 @@ resource 'SIZE' (-1) {
     canBackground, multiFinderAware, backgroundAndForeground,
     dontGetFrontClicks, ignoreChildDiedEvents, is32BitCompatible,
     reserved, reserved, reserved, reserved, reserved, reserved, reserved,
-    128 * 1024,
-    64 * 1024
+    1024 * 1024,
+    512 * 1024
 };
 
 resource 'vers' (1) {
