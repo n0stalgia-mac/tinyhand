@@ -4,6 +4,9 @@
  * The hand is drawn on the Window Manager port. A plain window covers the
  * desktop only while drawing is on, so clicks hit this app. That window is
  * not erased, so other applications stay visible. Drawing off hides it.
+ * Each update is composed in an offscreen buffer (a GWorld with Color
+ * QuickDraw, a 1-bit GrafPort without) and only the changed rectangle is
+ * copied to the screen, so the hand and the ink do not flicker.
  *
  * Retro68's 68k int is 16-bit. Coordinates and counts are short or long.
  * The same file also compiles for a classic PowerPC Mac (RetroPPC).
@@ -22,6 +25,7 @@
 #include <Sound.h>
 #include <Gestalt.h>
 #include <MacMemory.h>
+#include <QDOffscreen.h>
 
 #define kAppleMenu 128
 #define kFileMenu 129
@@ -114,6 +118,20 @@ static Rect gDeskRect;
 static BitMap gDeskBits;
 static PixMap gDeskPix;
 static Boolean gDeskValid;
+static Handle gDeskTemp;
+
+/* Offscreen frame: the saved desktop with the ink and the hand on top, in
+   global coordinates. present() composes the changed rectangle here and
+   copies that rectangle to the screen in one CopyBits. */
+static Boolean gFrameReady;
+static Boolean gFrameShown;
+static Boolean gDirtyAll;
+static GWorldPtr gFrameGW;
+static GrafPort gFramePort;
+static BitMap gFrameBits;
+static Ptr gFrameBase;
+static Rect gDirtyRect;
+static Rect gHandRect;
 
 static InkSeg gInk[kMaxSeg];
 static short gInkCount;
@@ -211,11 +229,34 @@ static void hide_arrow(void)
     gCursorHidden = true;
 }
 
+/* Add a rectangle to the area the next present() must recompose. */
+static void dirty_add(const Rect *r)
+{
+    if (EmptyRect(&gDirtyRect))
+        gDirtyRect = *r;
+    else
+        UnionRect(&gDirtyRect, r, &gDirtyRect);
+}
+
+/* Bounds of one ink segment, padded for the pen and the arrowhead. */
+static void seg_bounds(const InkSeg *s, Rect *r)
+{
+    r->left = (s->x0 < s->x1) ? s->x0 : s->x1;
+    r->right = (s->x0 < s->x1) ? s->x1 : s->x0;
+    r->top = (s->y0 < s->y1) ? s->y0 : s->y1;
+    r->bottom = (s->y0 < s->y1) ? s->y1 : s->y0;
+    r->left = (short)(r->left - 16);
+    r->top = (short)(r->top - 16);
+    r->right = (short)(r->right + 17);
+    r->bottom = (short)(r->bottom + 17);
+}
+
 static void ink_clear(void)
 {
     gInkCount = 0;
     gInkNext = 0;
     gDirty = true;
+    gDirtyAll = true;
 }
 
 static void ink_add(short x0, short y0, short x1, short y1)
@@ -225,6 +266,15 @@ static void ink_add(short x0, short y0, short x1, short y1)
     gInk[gInkNext].x1 = x1;
     gInk[gInkNext].y1 = y1;
     gInk[gInkNext].arrow = 0;
+    if (gInkCount < kMaxSeg) {
+        Rect r;
+
+        seg_bounds(&gInk[gInkNext], &r);
+        dirty_add(&r);
+    } else {
+        /* The ring is full: the oldest segment disappears. */
+        gDirtyAll = true;
+    }
     gInkNext = (short)((gInkNext + 1) & (kMaxSeg - 1));
     if (gInkCount < kMaxSeg)
         gInkCount = (short)(gInkCount + 1);
@@ -238,6 +288,12 @@ static void ink_set_last_arrow(void)
         return;
     idx = (short)((gInkNext - 1) & (kMaxSeg - 1));
     gInk[idx].arrow = 1;
+    {
+        Rect r;
+
+        seg_bounds(&gInk[idx], &r);
+        dirty_add(&r);
+    }
 }
 
 static long isqrt_long(long v)
@@ -288,11 +344,14 @@ static void draw_arrow(short x0, short y0, short x1, short y1)
     LineTo((short)(x1 + bx - px), (short)(y1 + by - py));
 }
 
-static void draw_ink(void)
+/* Draw the ink. With a rectangle, skip segments that cannot touch it. */
+static void draw_ink(const Rect *only)
 {
     short i;
     short idx;
     short n;
+    Rect sb;
+    Rect hit;
 
     n = gInkCount;
     if (n <= 0)
@@ -303,6 +362,13 @@ static void draw_ink(void)
         idx = gInkNext;
     PenNormal();
     for (i = 0; i < n; i++) {
+        if (only != NULL) {
+            seg_bounds(&gInk[idx], &sb);
+            if (!SectRect(&sb, only, &hit)) {
+                idx = (short)((idx + 1) & (kMaxSeg - 1));
+                continue;
+            }
+        }
         MoveTo(gInk[idx].x0, gInk[idx].y0);
         LineTo(gInk[idx].x1, gInk[idx].y1);
         if (gInk[idx].arrow)
@@ -456,6 +522,31 @@ static void union_point(Rect *r, short x, short y)
         r->top = y;
     if ((short)(y + 1) > r->bottom)
         r->bottom = (short)(y + 1);
+}
+
+/* Bounds of every pixel draw_hand can touch for any style, in global
+   coordinates, padded for the pen. Not clipped to the screen. */
+static void hand_bounds(Rect *r)
+{
+    short n;
+    short i;
+    short rad;
+
+    n = (short)(sizeof kHX / sizeof kHX[0]);
+    r->left = gHot.h;
+    r->right = (short)(gHot.h + 1);
+    r->top = gHot.v;
+    r->bottom = (short)(gHot.v + 1);
+    for (i = 0; i < n; i++)
+        union_point(r, (short)(gHot.h + sc(kHX[i])), (short)(gHot.v + sc(kHY[i])));
+    union_point(r, (short)(gHot.h + sc(-34)), (short)(gHot.v + sc(0)));
+    union_point(r, (short)(gHot.h + sc(25)), (short)(gHot.v + sc(148)));
+    rad = sc(5);
+    if (rad < 1)
+        rad = 1;
+    union_point(r, (short)(gHot.h - rad), (short)(gHot.v - rad));
+    union_point(r, (short)(gHot.h + rad + 1), (short)(gHot.v + rad + 1));
+    InsetRect(r, -4, -4);
 }
 
 /* Bounds of every pixel draw_hand and draw_ink can touch, in global
@@ -615,8 +706,15 @@ static void copy_under(Boolean toSave)
         CopyBits(save, screen, &r, &r, srcCopy, NULL);
 }
 
+static void restore_desktop(void);
+
 static void restore_under(void)
 {
+    if (gFrameShown) {
+        /* The offscreen path drew over the saved desktop. Put it back. */
+        restore_desktop();
+        gFrameShown = false;
+    }
     if (!gSaveValid)
         return;
     screen_begin();
@@ -630,6 +728,20 @@ static BitMap *desk_bitmap(void)
     if (gDepth == 1)
         return &gDeskBits;
     return (BitMap *)&gDeskPix;
+}
+
+static void free_desk(void)
+{
+    if (gDeskTemp != NULL) {
+        HUnlock(gDeskTemp);
+        DisposeHandle(gDeskTemp);
+        gDeskTemp = NULL;
+    } else if (gDeskBase != NULL) {
+        DisposePtr(gDeskBase);
+    }
+    gDeskBase = NULL;
+    gDeskSize = 0;
+    gDeskValid = false;
 }
 
 /* Copy the content area, including pixels owned by other applications.
@@ -655,10 +767,18 @@ static void snapshot_desktop(void)
     rb = row_bytes_for(w, gDepth);
     bytes = (long)rb * (long)h;
     if (gDeskBase == NULL || bytes != gDeskSize) {
-        if (gDeskBase != NULL)
-            DisposePtr(gDeskBase);
+        free_desk();
         gDeskBase = NewPtr(bytes);
-        gDeskSize = 0;
+        if (gDeskBase == NULL) {
+            /* A deep screen can be larger than this app's partition. */
+            OSErr terr;
+
+            gDeskTemp = TempNewHandle(bytes, &terr);
+            if (gDeskTemp != NULL) {
+                HLock(gDeskTemp);
+                gDeskBase = *gDeskTemp;
+            }
+        }
         if (gDeskBase == NULL)
             return;
         gDeskSize = bytes;
@@ -699,9 +819,167 @@ static void restore_desktop(void)
     screen_end();
 }
 
-/* Draw only the hand, the stick, and the ink. The pixels underneath are
-   copied aside first and put back when the drawing moves, so the desktop
-   and other applications stay visible. There is no full-screen window. */
+static Boolean has_color_qd(void)
+{
+    long qd_version;
+
+    qd_version = 0;
+    if (Gestalt(gestaltQuickdrawVersion, &qd_version) != noErr)
+        return false;
+    return (Boolean)(qd_version >= gestalt32BitQD);
+}
+
+/* Create the offscreen frame for the content area. With Color QuickDraw
+   (32-Bit QuickDraw, part of System 7 on every colour Mac) it is a GWorld
+   at the screen's depth, so colour desktops are composed in colour.
+   Without it, it is a 1-bit BitMap with its own GrafPort. */
+static void init_frame(void)
+{
+    Rect r;
+    short w;
+    short h;
+    short rb;
+    QDErr err;
+    GrafPtr savePort;
+    CGrafPtr saveGW;
+    GDHandle saveDev;
+
+    gFrameReady = false;
+    content_rect(&r);
+    w = (short)(r.right - r.left);
+    h = (short)(r.bottom - r.top);
+    if (w < 1 || h < 1)
+        return;
+    if (has_color_qd()) {
+        /* Depth 0: the depth and colours of the screen under r (global). */
+        gFrameGW = NULL;
+        err = NewGWorld(&gFrameGW, 0, &r, NULL, NULL, 0);
+        if (err != noErr || gFrameGW == NULL) {
+            gFrameGW = NULL;
+            err = NewGWorld(&gFrameGW, 0, &r, NULL, NULL, useTempMem);
+        }
+        if (err != noErr || gFrameGW == NULL) {
+            gFrameGW = NULL;
+            return;
+        }
+        /* Same coordinates as the screen, so drawing code is shared. */
+        GetGWorld(&saveGW, &saveDev);
+        SetGWorld(gFrameGW, NULL);
+        SetOrigin(r.left, r.top);
+        ClipRect(&r);
+        SetGWorld(saveGW, saveDev);
+        gFrameReady = true;
+        return;
+    }
+    rb = row_bytes_for(w, 1);
+    gFrameBase = NewPtr((long)rb * (long)h);
+    if (gFrameBase == NULL)
+        return;
+    gFrameBits.baseAddr = gFrameBase;
+    gFrameBits.rowBytes = rb;
+    gFrameBits.bounds = r;
+    GetPort(&savePort);
+    OpenPort(&gFramePort);
+    SetPortBits(&gFrameBits);
+    gFramePort.portRect = r;
+    RectRgn(gFramePort.visRgn, &r);
+    ClipRect(&r);
+    SetPort(savePort);
+    gFrameReady = true;
+}
+
+static void dispose_frame(void)
+{
+    if (!gFrameReady)
+        return;
+    gFrameReady = false;
+    if (gFrameGW != NULL) {
+        DisposeGWorld(gFrameGW);
+        gFrameGW = NULL;
+        return;
+    }
+    ClosePort(&gFramePort);
+    DisposePtr(gFrameBase);
+    gFrameBase = NULL;
+}
+
+/* Compose the changed rectangle off screen: saved desktop, then ink, then
+   the hand. Then copy that one rectangle to the screen. The screen never
+   shows a half-drawn state, so there is no flicker. Returns false when the
+   offscreen frame or the desktop copy is missing; the caller then draws
+   on the screen directly. */
+static Boolean present_offscreen(void)
+{
+    Rect all;
+    Rect d;
+    Rect hand;
+    BitMap *frame;
+    PixMapHandle pm;
+    GrafPtr savePort;
+    CGrafPtr saveGW;
+    GDHandle saveDev;
+
+    if (!gFrameReady || !gDeskValid || gDeskBase == NULL)
+        return false;
+    pm = NULL;
+    saveGW = NULL;
+    saveDev = NULL;
+    savePort = NULL;
+    if (gFrameGW != NULL) {
+        pm = GetGWorldPixMap(gFrameGW);
+        if (!LockPixels(pm))
+            return false;
+    }
+
+    content_rect(&all);
+    hand_bounds(&hand);
+    if (gDirtyAll || !gFrameShown) {
+        d = all;
+    } else {
+        d = hand;
+        UnionRect(&d, &gHandRect, &d);
+        if (!EmptyRect(&gDirtyRect))
+            UnionRect(&d, &gDirtyRect, &d);
+        if (!SectRect(&d, &all, &d))
+            SetRect(&d, 0, 0, 0, 0);
+    }
+
+    if (!EmptyRect(&d)) {
+        if (gFrameGW != NULL) {
+            GetGWorld(&saveGW, &saveDev);
+            SetGWorld(gFrameGW, NULL);
+            frame = &((GrafPtr)gFrameGW)->portBits;
+        } else {
+            GetPort(&savePort);
+            SetPort(&gFramePort);
+            frame = &gFramePort.portBits;
+        }
+        ClipRect(&d);
+        CopyBits(desk_bitmap(), frame, &d, &d, srcCopy, NULL);
+        draw_ink(&d);
+        draw_hand(gHot.h, gHot.v);
+        if (gFrameGW != NULL)
+            SetGWorld(saveGW, saveDev);
+        else
+            SetPort(savePort);
+
+        screen_begin();
+        CopyBits(frame, screen_bits(gOverlay), &d, &d, srcCopy, NULL);
+        screen_end();
+    }
+    if (pm != NULL)
+        UnlockPixels(pm);
+    gHandRect = hand;
+    gFrameShown = true;
+    gDirtyAll = false;
+    SetRect(&gDirtyRect, 0, 0, 0, 0);
+    return true;
+}
+
+/* Show the hand, the stick, and the ink over the desktop and other
+   applications. There is no full-screen painted window. The normal path
+   is present_offscreen. Without an offscreen frame, the pixels under the
+   drawing are copied aside and the drawing is done on the screen. */
 static void present(void)
 {
     Rect bounds;
@@ -710,6 +988,10 @@ static void present(void)
         return;
     gPresenting = true;
     gDirty = false;
+    if (!gSaveValid && present_offscreen()) {
+        gPresenting = false;
+        return;
+    }
     screen_begin();
     if (gSaveValid)
         copy_under(false);
@@ -722,7 +1004,7 @@ static void present(void)
             copy_under(true);
             gSaveValid = true;
         }
-        draw_ink();
+        draw_ink(NULL);
         draw_hand(gHot.h, gHot.v);
     }
     screen_end();
@@ -836,6 +1118,9 @@ static void show_shield(void)
     SelectWindow(gShield);
     gShieldShown = true;
     restore_desktop();
+    /* New desktop copy: the whole offscreen frame must be recomposed. */
+    gFrameShown = false;
+    gDirtyAll = true;
 }
 
 static void hide_shield(void)
@@ -1127,7 +1412,12 @@ static void handle_event(EventRecord *e)
             BeginUpdate(gShield);
             EndUpdate(gShield);
             if (gDrawing && !gSuspended) {
-                restore_desktop();
+                /* The offscreen frame already holds the desktop, so one
+                   full copy repairs the window without a blank step. */
+                if (gFrameReady && gDeskValid && !gSaveValid)
+                    gDirtyAll = true;
+                else
+                    restore_desktop();
                 present();
                 SetPort(gShield);
                 ValidRect(&gShield->portRect);
@@ -1196,13 +1486,25 @@ static void init_overlay(void)
 {
     Rect r;
 
-    GetWMgrPort(&gOverlay);
+    /* With Color QuickDraw the colour Window Manager port reaches the
+       screen at its real depth. The old port is 1-bit and would turn the
+       saved desktop black and white. */
+    if (has_color_qd()) {
+        CGrafPtr cport;
+
+        cport = NULL;
+        GetCWMgrPort(&cport);
+        gOverlay = (GrafPtr)cport;
+    }
+    if (gOverlay == NULL)
+        GetWMgrPort(&gOverlay);
     if (gOverlay == NULL)
         return;
     gClipSave = NewRgn();
     gVisSave = NewRgn();
     gDepth = read_depth(gOverlay);
     create_shield();
+    init_frame();
     content_rect(&r);
     gHot.h = (short)(r.left + (short)((r.right - r.left) / 2));
     gHot.v = (short)(r.top + (short)((r.bottom - r.top) / 2));
@@ -1289,10 +1591,10 @@ int main(void)
     show_arrow();
     if (gHand != NULL)
         KillPoly(gHand);
+    dispose_frame();
     if (gSaveBase != NULL)
         DisposePtr(gSaveBase);
-    if (gDeskBase != NULL)
-        DisposePtr(gDeskBase);
+    free_desk();
     if (gClipSave != NULL)
         DisposeRgn(gClipSave);
     if (gVisSave != NULL)
