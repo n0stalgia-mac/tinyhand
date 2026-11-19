@@ -249,17 +249,52 @@ static void dirty_add(const Rect *r)
         UnionRect(&gDirtyRect, r, &gDirtyRect);
 }
 
+/* Arrowhead length in pixels. The macOS head is max(14, lineWidth * 3.2).
+   The classic pen is kInkPen, and the hand already follows screen height,
+   so the head is the larger of eight pen widths and one twelfth of the
+   screen height. Eighteen pixels is the floor: a 10-pixel head on a
+   640×480 screen was a speck at the end of a 2-pixel stroke. */
+static short arrow_len(void)
+{
+    short sh;
+    long n;
+    long pen;
+
+    sh = (short)(qd.screenBits.bounds.bottom - qd.screenBits.bounds.top);
+    if (sh < 1)
+        sh = 342;
+    pen = (long)kInkPen * 8L;
+    n = (long)sh / 12L;
+    if (pen > n)
+        n = pen;
+    if (n < 18)
+        n = 18;
+    if (n > 96)
+        n = 96;
+    return (short)n;
+}
+
 /* Bounds of one ink segment, padded for the pen and the arrowhead. */
 static void seg_bounds(const InkSeg *s, Rect *r)
 {
+    short pad;
+
     r->left = (s->x0 < s->x1) ? s->x0 : s->x1;
     r->right = (s->x0 < s->x1) ? s->x1 : s->x0;
     r->top = (s->y0 < s->y1) ? s->y0 : s->y1;
     r->bottom = (s->y0 < s->y1) ? s->y1 : s->y0;
-    r->left = (short)(r->left - 16);
-    r->top = (short)(r->top - 16);
-    r->right = (short)(r->right + 17);
-    r->bottom = (short)(r->bottom + 17);
+    pad = (short)(kInkPen + 2);
+    if (s->arrow) {
+        short h;
+
+        h = (short)(arrow_len() + kInkPen);
+        if (h > pad)
+            pad = h;
+    }
+    r->left = (short)(r->left - pad);
+    r->top = (short)(r->top - pad);
+    r->right = (short)(r->right + pad + 1);
+    r->bottom = (short)(r->bottom + pad + 1);
 }
 
 static void ink_add(short x0, short y0, short x1, short y1);
@@ -380,29 +415,92 @@ static long isqrt_long(long v)
     return r;
 }
 
+/* Two strokes from the tip. (x0,y0) is a point back along the stroke,
+   far enough that a short final piece does not shrink the head.
+   The wing is half the head length (about the macOS spread of pi/7). */
 static void draw_arrow(short x0, short y0, short x1, short y1)
 {
     long dx;
     long dy;
     long len;
+    long head;
+    long wing;
     long bx;
     long by;
     long px;
     long py;
+    short pen;
 
     dx = (long)x1 - (long)x0;
     dy = (long)y1 - (long)y0;
     len = isqrt_long(dx * dx + dy * dy);
-    if (len < 1)
+    if (len < 2)
         return;
-    bx = -(dx * 10) / len;
-    by = -(dy * 10) / len;
-    px = -(dy * 4) / len;
-    py = (dx * 4) / len;
+    head = (long)arrow_len();
+    if (head > (len * 4) / 5)
+        head = (len * 4) / 5;
+    if (head < (long)kInkPen * 3)
+        head = (long)kInkPen * 3;
+    if (head < 8)
+        head = 8;
+    wing = head / 2;
+    if (wing < 3)
+        wing = 3;
+    bx = -(dx * head) / len;
+    by = -(dy * head) / len;
+    px = -(dy * wing) / len;
+    py = (dx * wing) / len;
+    pen = (short)(head / 8);
+    if (pen < kInkPen)
+        pen = kInkPen;
+    if (pen > 8)
+        pen = 8;
+    PenSize(pen, pen);
     MoveTo(x1, y1);
     LineTo((short)(x1 + bx + px), (short)(y1 + by + py));
     MoveTo(x1, y1);
     LineTo((short)(x1 + bx - px), (short)(y1 + by - py));
+    PenSize(kInkPen, kInkPen);
+}
+
+/* Aim from a point at least 1.2 head-lengths back along the ink,
+   walking the ring so the last short curve piece does not aim the head. */
+static void draw_arrow_on(short idx)
+{
+    short tipx;
+    short tipy;
+    short ax;
+    short ay;
+    short cur;
+    short steps;
+    short limit;
+    long need;
+    long dx;
+    long dy;
+
+    tipx = gInk[idx].x1;
+    tipy = gInk[idx].y1;
+    ax = gInk[idx].x0;
+    ay = gInk[idx].y0;
+    need = ((long)arrow_len() * 6L) / 5L;
+    if (need < 1)
+        need = 1;
+    cur = idx;
+    limit = gInkCount;
+    if (limit > 32)
+        limit = 32;
+    for (steps = 0; steps < limit; steps++) {
+        dx = (long)tipx - (long)gInk[cur].x0;
+        dy = (long)tipy - (long)gInk[cur].y0;
+        ax = gInk[cur].x0;
+        ay = gInk[cur].y0;
+        if (dx * dx + dy * dy >= need * need)
+            break;
+        if ((short)(steps + 1) >= gInkCount)
+            break;
+        cur = (short)((cur - 1) & (kMaxSeg - 1));
+    }
+    draw_arrow(ax, ay, tipx, tipy);
 }
 
 /* Draw the ink. With a rectangle, skip segments that cannot touch it. */
@@ -434,7 +532,7 @@ static void draw_ink(const Rect *only)
         MoveTo(gInk[idx].x0, gInk[idx].y0);
         LineTo(gInk[idx].x1, gInk[idx].y1);
         if (gInk[idx].arrow)
-            draw_arrow(gInk[idx].x0, gInk[idx].y0, gInk[idx].x1, gInk[idx].y1);
+            draw_arrow_on(idx);
         idx = (short)((idx + 1) & (kMaxSeg - 1));
     }
 }
@@ -650,7 +748,7 @@ static void content_bounds(Rect *r)
             idx = (short)((idx + 1) & (kMaxSeg - 1));
         }
     }
-    pad = 16;
+    pad = (short)(arrow_len() + kInkPen);
     r->left = (short)(r->left - pad);
     r->top = (short)(r->top - pad);
     r->right = (short)(r->right + pad);
