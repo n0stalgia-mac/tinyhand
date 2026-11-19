@@ -54,7 +54,13 @@
 #define kStyleRobot 3
 #define kStyleLaser 4
 
-#define kMaxSeg 256
+/* Power of two. A drag samples about once a tick and each sample can add
+   several short curve pieces, so the ring is larger than one segment per
+   mouse event. */
+#define kMaxSeg 1024
+/* QuickDraw pen. 2×2 covers the staircase of a 1-bit LineTo and stays a
+   solid stroke on a colour screen. */
+#define kInkPen 2
 #define kTapSlop 3
 #define kPolyH 64
 #define kPolyV 20
@@ -136,6 +142,11 @@ static Rect gHandRect;
 static InkSeg gInk[kMaxSeg];
 static short gInkCount;
 static short gInkNext;
+/* The newest segment runs to the cursor and is replaced when the next
+   sample arrives, so the committed stroke can end on a curve midpoint. */
+static Boolean gInkTip;
+static Point gSmoothP;
+static Boolean gSmoothHave;
 static short gScale = kScaleOne;
 
 /* Fingertip at (0, 0). Index up on the left, other fingers folded,
@@ -251,12 +262,62 @@ static void seg_bounds(const InkSeg *s, Rect *r)
     r->bottom = (short)(r->bottom + 17);
 }
 
+static void ink_add(short x0, short y0, short x1, short y1);
+
 static void ink_clear(void)
 {
     gInkCount = 0;
     gInkNext = 0;
+    gInkTip = false;
+    gSmoothHave = false;
     gDirty = true;
     gDirtyAll = true;
+}
+
+/* Drop the provisional segment that currently ends on the cursor. */
+static void ink_forget_tip(void)
+{
+    Rect r;
+    short idx;
+
+    if (!gInkTip || gInkCount <= 0)
+        return;
+    idx = (short)((gInkNext - 1) & (kMaxSeg - 1));
+    seg_bounds(&gInk[idx], &r);
+    dirty_add(&r);
+    gInkNext = idx;
+    gInkCount = (short)(gInkCount - 1);
+    gInkTip = false;
+    gDirty = true;
+}
+
+/* Quadratic Bezier from (x0,y0) to (x1,y1) with control (cx,cy). */
+static void ink_curve(short x0, short y0, short cx, short cy, short x1, short y1)
+{
+    short i;
+    short px;
+    short py;
+    short qx;
+    short qy;
+    const short n = 4;
+
+    px = x0;
+    py = y0;
+    for (i = 1; i <= n; i++) {
+        long u;
+        long t;
+        long den;
+
+        u = (long)n - (long)i;
+        t = (long)i;
+        den = (long)n * (long)n;
+        qx = (short)((u * u * (long)x0 + 2L * u * t * (long)cx + t * t * (long)x1) / den);
+        qy = (short)((u * u * (long)y0 + 2L * u * t * (long)cy + t * t * (long)y1) / den);
+        if (qx != px || qy != py)
+            ink_add(px, py, qx, qy);
+        px = qx;
+        py = qy;
+    }
 }
 
 static void ink_add(short x0, short y0, short x1, short y1)
@@ -361,6 +422,7 @@ static void draw_ink(const Rect *only)
     else
         idx = gInkNext;
     PenNormal();
+    PenSize(kInkPen, kInkPen);
     for (i = 0; i < n; i++) {
         if (only != NULL) {
             seg_bounds(&gInk[idx], &sb);
@@ -1215,13 +1277,20 @@ static void extend_ink(Point cur)
 {
     short dx;
     short dy;
+    short mx0;
+    short my0;
+    short mx1;
+    short my1;
 
     if (!gDragMoved) {
         dx = sab((short)(cur.h - gAnchor.h));
         dy = sab((short)(cur.v - gAnchor.v));
         if (dx <= kTapSlop && dy <= kTapSlop)
             return;
+        /* Provisional straight segment. The next sample replaces it. */
         ink_add(gAnchor.h, gAnchor.v, cur.h, cur.v);
+        gInkTip = true;
+        gSmoothHave = false;
         gDragMoved = true;
         gLastInk = cur;
         gDirty = true;
@@ -1229,7 +1298,33 @@ static void extend_ink(Point cur)
     }
     if (cur.h == gLastInk.h && cur.v == gLastInk.v)
         return;
-    ink_add(gLastInk.h, gLastInk.v, cur.h, cur.v);
+    ink_forget_tip();
+    if (!gSmoothHave) {
+        /* Two samples: keep a straight run from the anchor to the midpoint,
+           then a curve through the previous sample to the new midpoint. */
+        mx1 = (short)(((long)gAnchor.h + (long)gLastInk.h) / 2);
+        my1 = (short)(((long)gAnchor.v + (long)gLastInk.v) / 2);
+        if (mx1 != gAnchor.h || my1 != gAnchor.v)
+            ink_add(gAnchor.h, gAnchor.v, mx1, my1);
+        mx0 = (short)(((long)gLastInk.h + (long)cur.h) / 2);
+        my0 = (short)(((long)gLastInk.v + (long)cur.v) / 2);
+        ink_curve(mx1, my1, gLastInk.h, gLastInk.v, mx0, my0);
+        ink_add(mx0, my0, cur.h, cur.v);
+        gInkTip = true;
+        gSmoothP.h = mx0;
+        gSmoothP.v = my0;
+        gSmoothHave = true;
+        gLastInk = cur;
+        gDirty = true;
+        return;
+    }
+    mx1 = (short)(((long)gLastInk.h + (long)cur.h) / 2);
+    my1 = (short)(((long)gLastInk.v + (long)cur.v) / 2);
+    ink_curve(gSmoothP.h, gSmoothP.v, gLastInk.h, gLastInk.v, mx1, my1);
+    ink_add(mx1, my1, cur.h, cur.v);
+    gInkTip = true;
+    gSmoothP.h = mx1;
+    gSmoothP.v = my1;
     gLastInk = cur;
     gDirty = true;
 }
@@ -1326,6 +1421,8 @@ static void handle_mouse_down(EventRecord *e)
         return;
     gDragging = true;
     gDragMoved = false;
+    gInkTip = false;
+    gSmoothHave = false;
     gMouseMoved = true;
     gAnchor = global;
     gLastInk = global;
@@ -1575,7 +1672,11 @@ int main(void)
 
     while (!gDone) {
         if (gDrawing && !gSuspended) {
-            if (GetNextEvent(everyEvent, &e))
+            /* Sleep 0 while the button is down so GetMouse runs between
+           events. Sleep 1 tick otherwise, still often enough to follow
+           the cursor. GetNextEvent would block until the next event and
+           skip positions along the stroke. */
+        if (WaitNextEvent(everyEvent, &e, gDragging ? 0L : 1L, NULL))
                 handle_event(&e);
             track_mouse();
             if (gDirty && gDrawing && !gSuspended)
